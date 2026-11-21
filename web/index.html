@@ -12,6 +12,8 @@
     <p class="subtitle">
       首节点中途超时后，备用节点用「原提示词 + 网关已采纳词元」续写；
       网关只追加新词元、忽略迟到回包，整条回复共用一个词元上限。
+      已采纳词元按批下发：同一节点凑满 3 个成一批，或首批入批后 250ms
+      超时即发；切换节点或回复结束前先把当前批次发完，页面每批只更新一次。
     </p>
 
     <section class="panel">
@@ -45,6 +47,7 @@
       <div id="events" class="events" aria-live="polite"></div>
       <div class="meta-row">
         <span id="counter">已采纳词元：0</span>
+        <span id="batch-counter">批次：0</span>
         <span id="shares"></span>
       </div>
       <div id="verification" class="verification hidden"></div>

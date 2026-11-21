@@ -46,7 +46,18 @@ async def collect_sse(client: httpx.AsyncClient, scenario: str) -> list[tuple[st
 
 
 def tokens_of(events):
-    return [(e["index"], e["id"], e["text"], e["node"]) for name, e in events if name == "token"]
+    out = []
+    for name, e in events:
+        if name == "token":
+            out.append((e["index"], e["id"], e["text"], e["node"]))
+        elif name == "token_batch":
+            for t in e["tokens"]:
+                out.append((t["index"], t["id"], t["text"], t["node"]))
+    return out
+
+
+def token_batches_of(events):
+    return [list(e["tokens"]) for n, e in events if n == "token_batch"]
 
 
 def names_of(events):
@@ -204,3 +215,170 @@ def test_backup_rejects_wrong_prefix(registry):
 
 def test_determinism_across_nodes_and_runs(registry):
     asyncio.run(_determinism(registry))
+
+
+# --- token batching ----------------------------------------------------------
+
+async def _batcher_unit():
+    from gateway.app import TokenBatcher
+
+    b = TokenBatcher(size=3, max_wait=0.08)
+
+    def tok(index, node="node-a"):
+        return {"index": index, "id": index * 10, "text": f"t{index}", "node": node}
+
+    # The first two tokens stay buffered (size not reached yet).
+    await b.add(tok(0))
+    await b.add(tok(1))
+    assert b.pending()
+    # Third token fills the batch: the orchestrator then flushes immediately.
+    await b.add(tok(2))
+    assert b.is_full()
+    full = await b.flush()
+    assert [t["index"] for t in full] == [0, 1, 2]
+    assert not b.pending()
+    await b.close()
+
+
+async def _batcher_max_wait():
+    from gateway.app import TokenBatcher
+
+    b = TokenBatcher(size=3, max_wait=0.05)
+
+    def tok(index):
+        return {"index": index, "id": index, "text": f"t{index}", "node": "node-a"}
+
+    await b.add(tok(0))
+    # No further token arrives (upstream silence): the deadline still fires.
+    deadline = b.timer()
+    armed_epoch = b.epoch
+    done, _ = await asyncio.wait({deadline}, timeout=0.5)
+    assert deadline in done
+    assert b.epoch == armed_epoch  # no spurious re-arm while waiting
+    batch = await b.flush()
+    assert [t["index"] for t in batch] == [0]
+    assert not b.pending()
+    await b.close()
+
+
+async def _batcher_explicit_flush():
+    from gateway.app import TokenBatcher
+
+    b = TokenBatcher(size=3, max_wait=10)
+
+    def tok(index):
+        return {"index": index, "id": index, "text": f"t{index}", "node": "node-a"}
+
+    await b.add(tok(0))
+    await b.add(tok(1))
+    # End of reply / node switch: the pending partial batch must be sent now.
+    batch = await b.flush()
+    assert [t["index"] for t in batch] == [0, 1]
+    # Flushing with an empty buffer is a no-op (never emits an empty event).
+    assert await b.flush() is None
+    await b.close()
+
+
+async def _batcher_node_switch_splits_batch():
+    from gateway.app import TokenBatcher
+
+    b = TokenBatcher(size=3, max_wait=10)
+
+    def tok(index, node):
+        return {"index": index, "id": index, "text": f"t{index}", "node": node}
+
+    await b.add(tok(0, "node-a"))
+    await b.add(tok(1, "node-a"))
+    # A token from another node flushes the old batch before joining a new one.
+    forced = await b.add(tok(2, "node-b"))
+    assert [(t["index"], t["node"]) for t in forced] == [(0, "node-a"), (1, "node-a")]
+    # The new node's token is the only thing left buffered.
+    second = await b.flush()
+    assert [(t["index"], t["node"]) for t in second] == [(2, "node-b")]
+    assert await b.flush() is None
+    await b.close()
+
+
+async def _healthy_batching(gateway_client):
+    events = await collect_sse(gateway_client, "healthy")
+    names = names_of(events)
+    assert "token" not in names, "gateway must send token_batch, not bare token events"
+    assert names[0] == "meta"
+    assert names[-1] == "done"
+    batches = token_batches_of(events)
+    # Every batch is ordered, has no gaps/duplicates and never exceeds size 3.
+    flat_indices = [t["index"] for batch in batches for t in batch]
+    assert flat_indices == list(range(MAX_TOKENS))
+    assert all(len(batch) <= 3 for batch in batches)
+    # 12 tokens with size 3: four full batches.
+    assert [len(batch) for batch in batches] == [3, 3, 3, 3]
+    for batch in batches:
+        assert all(t["node"] == "node-a" for t in batch)
+        assert all("id" in t and "text" in t for t in batch)
+
+
+async def _failover_batching(gateway_client):
+    events = await collect_sse(gateway_client, "failover_success")
+    names = names_of(events)
+    fallback_pos = names.index("fallback")
+
+    primary_batches = [e for n, e in events[:fallback_pos] if n == "token_batch"]
+    # The 4 primary tokens were all delivered *before* the switch (the last
+    # partial batch is flushed by the max-wait deadline or the switch itself).
+    primary_tokens = [t for batch in primary_batches for t in batch["tokens"]]
+    assert len(primary_tokens) == STALL_BEFORE
+    assert all(t["node"] == "node-a" for t in primary_tokens)
+
+    backup_batches = [e for n, e in events[fallback_pos + 1:] if n == "token_batch"]
+    backup_tokens = [t for batch in backup_batches for t in batch["tokens"]]
+    assert len(backup_tokens) == MAX_TOKENS - STALL_BEFORE
+    assert all(t["node"] == "node-b" for t in backup_tokens)
+
+    # Every batch belongs to exactly one node and keeps the global order.
+    for event in (primary_batches + backup_batches):
+        nodes = {t["node"] for t in event["tokens"]}
+        assert len(nodes) == 1
+        assert len(event["tokens"]) <= 3
+    assert tokens_of(events)[-1][0] == MAX_TOKENS - 1
+    assert names[-1] == "done"
+
+
+async def _backup_failure_batching(gateway_client):
+    events = await collect_sse(gateway_client, "failover_backup_error")
+    batches = token_batches_of(events)
+    assert all(len(batch) <= 3 for batch in batches)
+    # All 7 accepted tokens still reach the page despite the failure.
+    assert [t["index"] for batch in batches for t in batch] == list(range(7))
+    # The incomplete event comes after the final flushed batch.
+    names = names_of(events)
+    assert names[-1] == "incomplete"
+    incomplete = next(e for n, e in events if n == "incomplete")
+    assert incomplete["accepted_count"] == 7
+
+
+def test_token_batcher_size_flush():
+    asyncio.run(_batcher_unit())
+
+
+def test_token_batcher_max_wait_deadline_flushes_on_silence():
+    asyncio.run(_batcher_max_wait())
+
+
+def test_token_batcher_explicit_flush_before_switch_or_end():
+    asyncio.run(_batcher_explicit_flush())
+
+
+def test_token_batcher_never_mixes_nodes_in_one_batch():
+    asyncio.run(_batcher_node_switch_splits_batch())
+
+
+def test_healthy_stream_is_sent_as_ordered_token_batches(gateway_client):
+    asyncio.run(_healthy_batching(gateway_client))
+
+
+def test_failover_flushes_primary_batch_before_switch(gateway_client):
+    asyncio.run(_failover_batching(gateway_client))
+
+
+def test_backup_failure_still_delivers_every_accepted_batch(gateway_client):
+    asyncio.run(_backup_failure_batching(gateway_client))

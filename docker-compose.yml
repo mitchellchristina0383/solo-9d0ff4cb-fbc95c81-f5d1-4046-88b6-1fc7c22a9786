@@ -42,6 +42,10 @@ services:
       NODE_A_URL: http://node-a:8000
       NODE_B_URL: http://node-b:8000
       GATEWAY_READ_TIMEOUT: "1.0"
+      # Downstream token batching: 3 tokens per token_batch event, or 250ms
+      # after the batch's first token (even when the upstream is silent).
+      TOKEN_BATCH_SIZE: "3"
+      TOKEN_BATCH_MAX_WAIT_MS: "250"
     ports:
       - "8080:8000"
     depends_on:

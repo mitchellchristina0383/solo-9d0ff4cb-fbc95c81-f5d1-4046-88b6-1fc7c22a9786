@@ -8,10 +8,12 @@ const statusEl = document.getElementById("status");
 const outputEl = document.getElementById("output");
 const eventsEl = document.getElementById("events");
 const counterEl = document.getElementById("counter");
+const batchCounterEl = document.getElementById("batch-counter");
 const sharesEl = document.getElementById("shares");
 const verificationEl = document.getElementById("verification");
 
 let expected = null;
+let batchCount = 0;
 
 async function loadScenarios() {
   const resp = await fetch("/api/scenarios");
@@ -48,18 +50,33 @@ function packetOrderGuard(index) {
   lastIndex = index;
 }
 
-function appendToken(obj) {
+// One DOM update per gateway batch: every token keeps its absolute index, id
+// and source node; the counters are refreshed once for the whole batch.
+function appendTokenBatch(tokens) {
   const placeholder = outputEl.querySelector(".placeholder");
   if (placeholder) placeholder.remove();
-  packetOrderGuard(obj.index);
-  // Append-only: never overwrite previously displayed tokens.
-  const chip = document.createElement("span");
-  chip.className = `token ${obj.node}`;
-  chip.dataset.index = obj.index;
-  chip.title = `index=${obj.index} id=${obj.id} 来源=${obj.node}`;
-  chip.textContent = obj.text;
-  outputEl.appendChild(chip);
-  counterEl.textContent = `已采纳词元：${obj.index + 1}`;
+  const fragment = document.createDocumentFragment();
+  for (const obj of tokens) {
+    packetOrderGuard(obj.index);
+    // Append-only: never overwrite previously displayed tokens.
+    const chip = document.createElement("span");
+    chip.className = `token ${obj.node}`;
+    chip.dataset.index = obj.index;
+    chip.title = `index=${obj.index} id=${obj.id} 来源=${obj.node}`;
+    chip.textContent = obj.text;
+    fragment.appendChild(chip);
+  }
+  outputEl.appendChild(fragment);
+  batchCount += 1;
+  const last = tokens[tokens.length - 1];
+  counterEl.textContent = `已采纳词元：${last.index + 1}`;
+  batchCounterEl.textContent = `批次：${batchCount}（本批 ${tokens.length} 个）`;
+}
+
+// Compatibility shim: a bare token event (older gateway) is treated as a
+// one-token batch.
+function appendToken(obj) {
+  appendTokenBatch([obj]);
 }
 
 function renderShares(nodes) {
@@ -137,6 +154,8 @@ async function run() {
   verificationEl.className = "verification hidden";
   verificationEl.innerHTML = "";
   counterEl.textContent = "已采纳词元：0";
+  batchCounterEl.textContent = "批次：0";
+  batchCount = 0;
   lastIndex = -1;
   expected = null;
   const tokens = [];
@@ -162,9 +181,14 @@ async function run() {
       const obj = JSON.parse(data);
       switch (event) {
         case "meta":
-          addEvent("", `请求 ${obj.request_id.slice(0, 8)}… 场景=<b>${obj.scenario}</b>，词元上限=${obj.max_tokens}`);
+          addEvent("", `请求 ${obj.request_id.slice(0, 8)}… 场景=<b>${obj.scenario}</b>，词元上限=${obj.max_tokens}，每批最多 ${obj.batch_size} 个、首批入批起 ${obj.batch_max_wait_ms}ms 超时发出`);
+          break;
+        case "token_batch":
+          appendTokenBatch(obj.tokens);
+          tokens.push(...obj.tokens);
           break;
         case "token":
+          // Bare single-token events (older gateway) still work.
           appendToken(obj);
           tokens.push(obj);
           break;
@@ -178,7 +202,7 @@ async function run() {
           break;
         case "done":
           renderShares(obj.nodes);
-          addEvent("ok", `✔ 完成：共 ${obj.token_count} 个词元`);
+          addEvent("ok", `✔ 完成：共 ${obj.token_count} 个词元，分 ${batchCount} 个批次接收`);
           break;
         default:
           addEvent("", JSON.stringify(obj));

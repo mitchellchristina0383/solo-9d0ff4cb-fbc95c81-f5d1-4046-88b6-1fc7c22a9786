@@ -94,6 +94,12 @@ class GatewayConfig:
     backup_name: str = "node-b"
     # Maximum silence (no SSE event) before the primary is declared timed out.
     read_timeout: float = float(os.environ.get("GATEWAY_READ_TIMEOUT", "1.0"))
+    # Downstream batching: accepted tokens are coalesced into token_batch
+    # events. A batch leaves the gateway when it reaches this many tokens, or
+    # max_wait seconds after its first token was added (also while the upstream
+    # is silent), or explicitly on a node switch / terminal event.
+    batch_size: int = int(os.environ.get("TOKEN_BATCH_SIZE", "3"))
+    batch_max_wait: float = float(os.environ.get("TOKEN_BATCH_MAX_WAIT_MS", "250")) / 1000.0
     web_dir: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web")
 
 
@@ -133,6 +139,83 @@ def default_client_factory(base_url: str) -> httpx.AsyncClient:
     # Generous client timeouts; the gateway enforces its own read timeout so
     # the behavior is identical with in-process test transports.
     return httpx.AsyncClient(base_url=base_url, timeout=httpx.Timeout(30.0, read=30.0))
+
+
+class TokenBatcher:
+    """Coalesce accepted tokens from one node into ``token_batch`` events.
+
+    A buffered batch is emitted as soon as one of the following happens:
+
+    * it reaches ``size`` accepted tokens (immediate flush);
+    * ``max_wait`` seconds elapsed since the batch's *first* token was added —
+      the deadline keeps ticking even while the upstream node is silent;
+    * :meth:`flush` is called explicitly (node switch, end of reply, error).
+
+    Each token keeps its absolute index, id, text and source node. All tokens
+    inside one batch come from the same node in original order; a token from a
+    different node first flushes the pending batch.
+
+    An ``epoch`` counter is bumped every time the deadline is (re)armed or
+    reset; the orchestrator pairs a timer task with the epoch it saw when it
+    started waiting, so a stale reference to an already-fired timer can never
+    cancel the current batch's fresh deadline.
+    """
+
+    def __init__(self, size: int, max_wait: float):
+        self.size = size
+        self.max_wait = max_wait
+        self._buffer: list[dict] = []
+        self._timer: asyncio.Task | None = None
+        self.epoch = 0
+
+    def pending(self) -> bool:
+        return bool(self._buffer)
+
+    def timer(self) -> asyncio.Task | None:
+        """Task that completes when the current batch's max-wait deadline fires."""
+        return self._timer
+
+    async def add(self, token: dict) -> list[dict] | None:
+        """Buffer one accepted token.
+
+        Returns a batch only when a node switch forces the pending batch out
+        early; size-limit flushes remain the orchestrator's job via
+        :meth:`is_full`.
+        """
+        forced: list[dict] | None = None
+        if self._buffer and self._buffer[0]["node"] != token["node"]:
+            # Defensive: batches never span a node switch.
+            forced = await self.flush()
+        self._buffer.append(token)
+        if self._timer is None:
+            self._timer = asyncio.ensure_future(asyncio.sleep(self.max_wait))
+            self.epoch += 1
+        return forced
+
+    def is_full(self) -> bool:
+        return len(self._buffer) >= self.size
+
+    async def flush(self) -> list[dict] | None:
+        """Emit the pending batch (if any) and reset the deadline."""
+        await self.dismiss_timer()
+        if not self._buffer:
+            return None
+        batch = self._buffer
+        self._buffer = []
+        return batch
+
+    async def dismiss_timer(self) -> None:
+        if self._timer is not None and not self._timer.done():
+            self._timer.cancel()
+            try:
+                await self._timer
+            except asyncio.CancelledError:
+                pass
+        self._timer = None
+        self.epoch += 1
+
+    async def close(self) -> None:
+        await self.dismiss_timer()
 
 
 def create_app(
@@ -180,6 +263,21 @@ def create_app(
 # Orchestration state machine
 # ---------------------------------------------------------------------------
 
+async def _read_upstream_event(
+    event_iter: AsyncIterator[tuple[str, str]],
+    timeout: float | None,
+) -> tuple[str, str]:
+    """Return the next upstream ``(event, data)`` pair.
+
+    A per-read timeout (not a whole-request timeout) is applied when
+    ``timeout`` is given; on silence it raises :class:`asyncio.TimeoutError`.
+    """
+    nxt = event_iter.__anext__()
+    if timeout is None:
+        return await nxt
+    return await asyncio.wait_for(nxt, timeout=timeout)
+
+
 async def _orchestrate(
     body: ChatRequest,
     request_id: str,
@@ -193,6 +291,9 @@ async def _orchestrate(
     provenance: list[str] = []
     primary_identity: tuple[str, str] | None = None
     next_index = 0
+    # One batcher for the whole reply. The pending batch is always drained
+    # before a node switch or any terminal event, so batches never mix nodes.
+    batcher = TokenBatcher(cfg.batch_size, cfg.batch_max_wait)
 
     yield sse("meta", {
         "request_id": request_id,
@@ -200,6 +301,8 @@ async def _orchestrate(
         "max_tokens": max_tokens,
         "primary": cfg.primary_name,
         "backup": cfg.backup_name,
+        "batch_size": cfg.batch_size,
+        "batch_max_wait_ms": round(cfg.batch_max_wait * 1000),
     })
 
     def accept_token(obj: dict, node: str) -> bool:
@@ -218,171 +321,268 @@ async def _orchestrate(
         next_index += 1
         return True
 
-    # ---- primary node ------------------------------------------------------
-    primary_fault = faults["primary"]
-    primary_payload = {
-        "request_id": request_id,
-        "prompt": prompt,
-        "start": 0,
-        "max_tokens": max_tokens,
-        "accepted_ids": [],
-        "prefix_text": "",
-        **primary_fault.body,
-    }
+    async def drain_batch() -> AsyncIterator[bytes]:
+        """Send the pending batch before a switch or a terminal event."""
+        batch = await batcher.flush()
+        if batch is not None:
+            yield sse("token_batch", {"tokens": batch})
 
-    timed_out = False
-    primary_error: str | None = None
     try:
-        async with make_client(cfg.node_a_url) as client:
-            async with client.stream("POST", "/generate", json=primary_payload,
-                                     headers=primary_fault.headers) as resp:
-                if resp.status_code != 200:
-                    detail = await resp.aread()
-                    primary_error = f"http_{resp.status_code}:{detail[:200]!r}"
-                else:
-                    event_iter = iter_sse_events(resp)
-                    while True:
-                        try:
-                            event, data = await asyncio.wait_for(
-                                event_iter.__anext__(), timeout=cfg.read_timeout
-                            )
-                        except StopAsyncIteration:
-                            break
-                        except asyncio.TimeoutError:
-                            timed_out = True
-                            logger.warning(
-                                "primary %s read timeout after %d accepted token(s) for %s",
-                                cfg.primary_name, next_index, request_id,
-                            )
-                            break
-                        if event == "meta":
-                            info = json.loads(data)
-                            primary_identity = (info["model_id"], info["tokenizer_version"])
-                        elif event == "token":
-                            obj = json.loads(data)
-                            if accept_token(obj, cfg.primary_name):
-                                yield sse("token", {**obj, "node": cfg.primary_name})
-                                if next_index >= max_tokens:
-                                    break
-                        elif event == "error":
-                            primary_error = data
-                            logger.warning("primary %s stream error: %s", cfg.primary_name, data)
-                            break
-                        elif event == "done":
-                            break
-    except httpx.HTTPError as exc:
-        primary_error = f"{type(exc).__name__}: {exc}"
-
-    # Healthy completion on the primary: nothing else to do.
-    if not timed_out and primary_error is None and next_index >= max_tokens:
-        yield sse("done", {
-            "reason": "max_tokens", "token_count": next_index,
-            "nodes": _node_shares(provenance),
-        })
-        return
-
-    # Primary finished without error but short of the budget: treat as failure.
-    if not timed_out and primary_error is None:
-        primary_error = "primary_ended_early"
-
-    if next_index >= max_tokens:
-        yield sse("done", {
-            "reason": "max_tokens", "token_count": next_index,
-            "nodes": _node_shares(provenance),
-        })
-        return
-
-    yield sse("fallback", {
-        "reason": "read_timeout" if timed_out else "primary_error",
-        "from_node": cfg.primary_name,
-        "to_node": cfg.backup_name,
-        "accepted_count": next_index,
-        "detail": primary_error,
-    })
-
-    # ---- backup node: identity check --------------------------------------
-    backup_fault = faults["backup"]
-    async with make_client(cfg.node_b_url) as client:
-        try:
-            info_resp = await client.get("/info", headers=backup_fault.info_headers)
-            info_resp.raise_for_status()
-            backup_info = info_resp.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            yield sse("incomplete", {
-                "reason": "backup_unreachable",
-                "detail": str(exc),
-                "accepted_count": next_index,
-                "prefix_text": " ".join(accepted_texts),
-            })
-            return
-        backup_identity = (backup_info["model_id"], backup_info["tokenizer_version"])
-
-        if primary_identity is not None and backup_identity != primary_identity:
-            logger.warning(
-                "refusing failover for %s: identity mismatch primary=%s backup=%s",
-                request_id, primary_identity, backup_identity,
-            )
-            yield sse("incomplete", {
-                "reason": "version_mismatch",
-                "primary_identity": {"model_id": primary_identity[0],
-                                     "tokenizer_version": primary_identity[1]},
-                "backup_identity": {"model_id": backup_identity[0],
-                                    "tokenizer_version": backup_identity[1]},
-                "accepted_count": next_index,
-                "prefix_text": " ".join(accepted_texts),
-            })
-            return
-
-        # ---- backup continuation with the shared token budget -------------
-        remaining = max_tokens - next_index
-        backup_payload = {
+        # ---- primary node --------------------------------------------------
+        primary_fault = faults["primary"]
+        primary_payload = {
             "request_id": request_id,
             "prompt": prompt,
-            "start": next_index,
-            "max_tokens": remaining,
-            "accepted_ids": accepted_ids,
-            "prefix_text": " ".join(accepted_texts),
-            **backup_fault.body,
+            "start": 0,
+            "max_tokens": max_tokens,
+            "accepted_ids": [],
+            "prefix_text": "",
+            **primary_fault.body,
         }
-        backup_failed: str | None = None
+
+        timed_out = False
+        primary_error: str | None = None
         try:
-            async with client.stream("POST", "/generate", json=backup_payload,
-                                     headers=backup_fault.headers) as resp:
-                if resp.status_code != 200:
-                    detail = await resp.aread()
-                    backup_failed = f"http_{resp.status_code}:{detail[:200]!r}"
-                else:
-                    async for event, data in iter_sse_events(resp):
-                        if event == "token":
-                            obj = json.loads(data)
-                            if accept_token(obj, cfg.backup_name):
-                                yield sse("token", {**obj, "node": cfg.backup_name})
-                                if next_index >= max_tokens:
+            async with make_client(cfg.node_a_url) as client:
+                async with client.stream("POST", "/generate", json=primary_payload,
+                                         headers=primary_fault.headers) as resp:
+                    if resp.status_code != 200:
+                        detail = await resp.aread()
+                        primary_error = f"http_{resp.status_code}:{detail[:200]!r}"
+                    else:
+                        event_iter = iter_sse_events(resp)
+                        read_task: asyncio.Task | None = None
+                        while True:
+                            if read_task is None:
+                                read_task = asyncio.ensure_future(
+                                    _read_upstream_event(event_iter, cfg.read_timeout)
+                                )
+                            waitables = {read_task}
+                            timer = batcher.timer()
+                            timer_epoch = batcher.epoch
+                            if timer is not None:
+                                waitables.add(timer)
+                            done, _ = await asyncio.wait(
+                                waitables, return_when=asyncio.FIRST_COMPLETED
+                            )
+                            if read_task in done:
+                                try:
+                                    event, data = read_task.result()
+                                except StopAsyncIteration:
+                                    read_task = None
                                     break
-                        elif event == "error":
-                            backup_failed = data
-                            break
-                        elif event == "done":
-                            break
+                                except asyncio.TimeoutError:
+                                    read_task = None
+                                    timed_out = True
+                                    logger.warning(
+                                        "primary %s read timeout after %d accepted token(s) for %s",
+                                        cfg.primary_name, next_index, request_id,
+                                    )
+                                    break
+                                read_task = None
+                                if event == "meta":
+                                    info = json.loads(data)
+                                    primary_identity = (info["model_id"], info["tokenizer_version"])
+                                elif event == "token":
+                                    obj = json.loads(data)
+                                    if accept_token(obj, cfg.primary_name):
+                                        forced = await batcher.add(
+                                            {**obj, "node": cfg.primary_name}
+                                        )
+                                        if forced is not None:
+                                            yield sse("token_batch", {"tokens": forced})
+                                        if batcher.is_full():
+                                            batch = await batcher.flush()
+                                            yield sse("token_batch", {"tokens": batch})
+                                        if next_index >= max_tokens:
+                                            break
+                                elif event == "error":
+                                    primary_error = data
+                                    logger.warning(
+                                        "primary %s stream error: %s",
+                                        cfg.primary_name, data,
+                                    )
+                                    break
+                                elif event == "done":
+                                    break
+                            # The current batch's max-wait deadline fired
+                            # (the upstream may still be silent). The epoch
+                            # check makes a stale timer reference harmless.
+                            if (
+                                timer is not None
+                                and timer_epoch == batcher.epoch
+                                and timer.done()
+                            ):
+                                batch = await batcher.flush()
+                                if batch is not None:
+                                    yield sse("token_batch", {"tokens": batch})
         except httpx.HTTPError as exc:
-            backup_failed = f"{type(exc).__name__}: {exc}"
+            primary_error = f"{type(exc).__name__}: {exc}"
 
-    if backup_failed is not None or next_index < max_tokens:
-        logger.warning("backup continuation failed for %s: %s", request_id, backup_failed)
-        yield sse("incomplete", {
-            "reason": "backup_failed",
-            "detail": backup_failed,
+        # Healthy completion on the primary: nothing else to do.
+        if not timed_out and primary_error is None and next_index >= max_tokens:
+            async for chunk in drain_batch():
+                yield chunk
+            yield sse("done", {
+                "reason": "max_tokens", "token_count": next_index,
+                "nodes": _node_shares(provenance),
+            })
+            return
+
+        # Primary finished without error but short of the budget: treat as failure.
+        if not timed_out and primary_error is None:
+            primary_error = "primary_ended_early"
+
+        if next_index >= max_tokens:
+            async for chunk in drain_batch():
+                yield chunk
+            yield sse("done", {
+                "reason": "max_tokens", "token_count": next_index,
+                "nodes": _node_shares(provenance),
+            })
+            return
+
+        # Node switch: send the accepted-but-unsent tokens before the fallback
+        # notice so nothing stays buffered across the switch.
+        async for chunk in drain_batch():
+            yield chunk
+        yield sse("fallback", {
+            "reason": "read_timeout" if timed_out else "primary_error",
+            "from_node": cfg.primary_name,
+            "to_node": cfg.backup_name,
             "accepted_count": next_index,
-            "prefix_text": " ".join(accepted_texts),
+            "detail": primary_error,
         })
-        return
 
-    yield sse("done", {
-        "reason": "max_tokens",
-        "token_count": next_index,
-        "nodes": _node_shares(provenance),
-        "identical_to_healthy": True,
-    })
+        # ---- backup node: identity check ----------------------------------
+        backup_fault = faults["backup"]
+        async with make_client(cfg.node_b_url) as client:
+            try:
+                info_resp = await client.get("/info", headers=backup_fault.info_headers)
+                info_resp.raise_for_status()
+                backup_info = info_resp.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                async for chunk in drain_batch():
+                    yield chunk
+                yield sse("incomplete", {
+                    "reason": "backup_unreachable",
+                    "detail": str(exc),
+                    "accepted_count": next_index,
+                    "prefix_text": " ".join(accepted_texts),
+                })
+                return
+            backup_identity = (backup_info["model_id"], backup_info["tokenizer_version"])
+
+            if primary_identity is not None and backup_identity != primary_identity:
+                logger.warning(
+                    "refusing failover for %s: identity mismatch primary=%s backup=%s",
+                    request_id, primary_identity, backup_identity,
+                )
+                async for chunk in drain_batch():
+                    yield chunk
+                yield sse("incomplete", {
+                    "reason": "version_mismatch",
+                    "primary_identity": {"model_id": primary_identity[0],
+                                         "tokenizer_version": primary_identity[1]},
+                    "backup_identity": {"model_id": backup_identity[0],
+                                        "tokenizer_version": backup_identity[1]},
+                    "accepted_count": next_index,
+                    "prefix_text": " ".join(accepted_texts),
+                })
+                return
+
+            # ---- backup continuation with the shared token budget ---------
+            remaining = max_tokens - next_index
+            backup_payload = {
+                "request_id": request_id,
+                "prompt": prompt,
+                "start": next_index,
+                "max_tokens": remaining,
+                "accepted_ids": accepted_ids,
+                "prefix_text": " ".join(accepted_texts),
+                **backup_fault.body,
+            }
+            backup_failed: str | None = None
+            try:
+                async with client.stream("POST", "/generate", json=backup_payload,
+                                         headers=backup_fault.headers) as resp:
+                    if resp.status_code != 200:
+                        detail = await resp.aread()
+                        backup_failed = f"http_{resp.status_code}:{detail[:200]!r}"
+                    else:
+                        event_iter = iter_sse_events(resp)
+                        read_task: asyncio.Task | None = None
+                        while True:
+                            if read_task is None:
+                                read_task = asyncio.ensure_future(
+                                    _read_upstream_event(event_iter, None)
+                                )
+                            waitables = {read_task}
+                            timer = batcher.timer()
+                            timer_epoch = batcher.epoch
+                            if timer is not None:
+                                waitables.add(timer)
+                            done, _ = await asyncio.wait(
+                                waitables, return_when=asyncio.FIRST_COMPLETED
+                            )
+                            if read_task in done:
+                                try:
+                                    event, data = read_task.result()
+                                except StopAsyncIteration:
+                                    read_task = None
+                                    break
+                                read_task = None
+                                if event == "token":
+                                    obj = json.loads(data)
+                                    if accept_token(obj, cfg.backup_name):
+                                        forced = await batcher.add(
+                                            {**obj, "node": cfg.backup_name}
+                                        )
+                                        if forced is not None:
+                                            yield sse("token_batch", {"tokens": forced})
+                                        if batcher.is_full():
+                                            batch = await batcher.flush()
+                                            yield sse("token_batch", {"tokens": batch})
+                                        if next_index >= max_tokens:
+                                            break
+                                elif event == "error":
+                                    backup_failed = data
+                                    break
+                                elif event == "done":
+                                    break
+                            if (
+                                timer is not None
+                                and timer_epoch == batcher.epoch
+                                and timer.done()
+                            ):
+                                batch = await batcher.flush()
+                                if batch is not None:
+                                    yield sse("token_batch", {"tokens": batch})
+            except httpx.HTTPError as exc:
+                backup_failed = f"{type(exc).__name__}: {exc}"
+
+        if backup_failed is not None or next_index < max_tokens:
+            logger.warning("backup continuation failed for %s: %s", request_id, backup_failed)
+            async for chunk in drain_batch():
+                yield chunk
+            yield sse("incomplete", {
+                "reason": "backup_failed",
+                "detail": backup_failed,
+                "accepted_count": next_index,
+                "prefix_text": " ".join(accepted_texts),
+            })
+            return
+
+        async for chunk in drain_batch():
+            yield chunk
+        yield sse("done", {
+            "reason": "max_tokens",
+            "token_count": next_index,
+            "nodes": _node_shares(provenance),
+            "identical_to_healthy": True,
+        })
+    finally:
+        await batcher.close()
 
 
 def _node_shares(provenance: list[str]) -> dict[str, int]:

@@ -61,10 +61,15 @@ async def consume(client: httpx.AsyncClient, scenario: str):
 
 def report(scenario: str, events, healthy_ids):
     print(f"\n{'=' * 78}\n场景: {scenario}\n{'=' * 78}")
-    tokens = [e for n, e in events if n == "token"]
+    batches = [e for n, e in events if n == "token_batch"]
+    tokens = [t for e in batches for t in e["tokens"]]
+    # Tolerate bare single-token events too.
+    tokens.extend(e for n, e in events if n == "token")
     for name, e in events:
         if name == "meta":
-            print(f"[meta] request={e['request_id'][:8]}… 上限={e['max_tokens']}")
+            print(f"[meta] request={e['request_id'][:8]}… 上限={e['max_tokens']}，"
+                  f"批量设置={e.get('batch_size', 1)} 个/批、"
+                  f"{e.get('batch_max_wait_ms', 0)}ms 超时")
         elif name == "fallback":
             print(f"[fallback] {e['reason']}：{e['from_node']} 已采纳 {e['accepted_count']} "
                   f"个词元后切换到 {e['to_node']}")
@@ -78,6 +83,9 @@ def report(scenario: str, events, healthy_ids):
         by_node.setdefault(t["node"], []).append(t["text"])
     for node, texts in by_node.items():
         print(f"[tokens:{node}] ({len(texts)}) {' '.join(texts)}")
+    sizes = [len(e["tokens"]) for e in batches]
+    print(f"[批次] 共 {len(batches)} 个 token_batch 事件，各批词元数={sizes} "
+          f"（网页更新次数=批次数）")
     ids = [t["id"] for t in tokens]
     final = "done" in {n for n, _ in events}
     if final:
