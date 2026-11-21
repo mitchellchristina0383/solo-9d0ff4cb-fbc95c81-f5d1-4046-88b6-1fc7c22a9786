@@ -1,0 +1,51 @@
+services:
+  node-a:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    environment:
+      NODE_ID: node-a
+      MODEL_ID: mock-llm-7b
+      TOKENIZER_VERSION: tok-v1
+      # 0.12s per token; the gateway's 1.0s read timeout fires on the stall.
+      EMIT_INTERVAL: "0.12"
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/info')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  node-b:
+    build:
+      context: .
+      dockerfile: Dockerfile.node
+    environment:
+      NODE_ID: node-b
+      MODEL_ID: mock-llm-7b
+      TOKENIZER_VERSION: tok-v1
+      EMIT_INTERVAL: "0.12"
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/info')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.gateway
+    environment:
+      NODE_A_URL: http://node-a:8000
+      NODE_B_URL: http://node-b:8000
+      GATEWAY_READ_TIMEOUT: "1.0"
+    ports:
+      - "8080:8000"
+    depends_on:
+      node-a:
+        condition: service_healthy
+      node-b:
+        condition: service_healthy

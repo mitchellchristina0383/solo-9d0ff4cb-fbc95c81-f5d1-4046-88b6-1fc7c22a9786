@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>流式故障切换网关演示</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <main class="container">
+    <h1>流式故障切换网关演示</h1>
+    <p class="subtitle">
+      首节点中途超时后，备用节点用「原提示词 + 网关已采纳词元」续写；
+      网关只追加新词元、忽略迟到回包，整条回复共用一个词元上限。
+    </p>
+
+    <section class="panel">
+      <form id="chat-form">
+        <label>
+          提示词
+          <input id="prompt" type="text" value="请写一段关于秋天的短文" required maxlength="1000" />
+        </label>
+        <div class="row">
+          <label class="grow-1">
+            输出词元上限
+            <input id="max-tokens" type="number" value="12" min="1" max="128" required />
+          </label>
+          <label class="grow-2">
+            故障场景
+            <select id="scenario"></select>
+          </label>
+        </div>
+        <div class="row">
+          <button type="submit" id="run-btn">生成回复</button>
+          <span id="status" class="status idle">空闲</span>
+        </div>
+      </form>
+    </section>
+
+    <section class="panel">
+      <h2>逐步生成的回复</h2>
+      <div id="output" class="output" aria-live="polite">
+        <span class="placeholder">（回复将在这里逐词元出现）</span>
+      </div>
+      <div id="events" class="events" aria-live="polite"></div>
+      <div class="meta-row">
+        <span id="counter">已采纳词元：0</span>
+        <span id="shares"></span>
+      </div>
+      <div id="verification" class="verification hidden"></div>
+    </section>
+
+    <section class="panel">
+      <h2>场景说明</h2>
+      <ul class="legend">
+        <li><b>healthy</b>：无故障，首节点一次生成完整回复（基准结果）。</li>
+        <li><b>failover_success</b>：首节点在第 4 个词元后挂起触发读超时，备用节点续写，最终结果与 healthy 完全一致。</li>
+        <li><b>failover_backup_error</b>：首节点超时，备用节点续写途中失败 —— 保留已显示文本并标记未完成。</li>
+        <li><b>version_mismatch</b>：首节点超时，备用节点模型/分词器版本不一致 —— 不接续，保留已显示文本并标记未完成。</li>
+      </ul>
+      <p class="legend">
+        词元颜色：<span class="chip node-a">node-a（首节点）</span>
+        <span class="chip node-b">node-b（备用节点）</span>
+      </p>
+    </section>
+  </main>
+  <script src="/app.js"></script>
+</body>
+</html>
